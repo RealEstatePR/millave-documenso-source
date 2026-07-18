@@ -10,12 +10,16 @@ The patch applies to the public upstream Documenso release:
 - upstream release: v2.15.0
 - exact upstream commit: c5efd34e95737f98f64c31214cebee80fb598f29
 
-It adds the top-level, privacy-preserving locale handoff and a visible Source
-link on the signing host. The link uses a no-referrer policy so a signing-page
-path is not sent to this repository.
+It adds the top-level, privacy-preserving locale handoff and a visible
+source-and-license notice on the signing host. The link uses a no-referrer
+policy so a signing-page path is not sent to this repository.
+
+The current source-offer release is `documenso-v2.15.0-millave.2`. It
+supersedes `.1` by making the notice identify the Mi Llave modification
+scope, GNU AGPL v3 availability, and no-warranty statement more explicitly.
 
 Start with [SOURCE-OFFER.md](SOURCE-OFFER.md). The instructions reproduce and
-verify the patch against the exact upstream commit.
+verify the current patch against the exact upstream commit.
 
 ## Deliberate exclusions
 

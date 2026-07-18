@@ -1,7 +1,7 @@
 # Reproduce the Mi Llave locale-handoff patch
 
 This repository is a public source offer for the Mi Llave modifications included
-in PATCHES/documenso-v2.15.0-millave.1.patch. It intentionally does not include
+in PATCHES/documenso-v2.15.0-millave.2.patch. It intentionally does not include
 an upstream Documenso source mirror or any production configuration.
 
 ## Pinned upstream source
@@ -21,9 +21,9 @@ upstream source:
     git -C documenso-upstream checkout c5efd34e95737f98f64c31214cebee80fb598f29
     shasum -a 256 -c PATCHES/SHA256SUMS
     git -C documenso-upstream apply --check --whitespace=error-all \
-      ../millave-documenso-source/PATCHES/documenso-v2.15.0-millave.1.patch
+      ../millave-documenso-source/PATCHES/documenso-v2.15.0-millave.2.patch
     git -C documenso-upstream apply --whitespace=error-all \
-      ../millave-documenso-source/PATCHES/documenso-v2.15.0-millave.1.patch
+      ../millave-documenso-source/PATCHES/documenso-v2.15.0-millave.2.patch
 
 Alternatively, run:
 
@@ -31,6 +31,11 @@ Alternatively, run:
 
 The script checks the upstream commit and patch checksum, then runs only
 git apply --check; it does not modify the upstream checkout.
+
+Release `documenso-v2.15.0-millave.2` supersedes `.1` with a
+compact host-visible notice that identifies Mi Llave's modification scope,
+GNU AGPL v3 availability, and its no-warranty statement. The `.1`
+patch remains in this repository for reproducibility of the prior release.
 
 ## Deployment boundary
 

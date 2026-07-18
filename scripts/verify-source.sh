@@ -2,7 +2,7 @@
 set -eu
 
 EXPECTED_COMMIT='c5efd34e95737f98f64c31214cebee80fb598f29'
-PATCH_PATH='PATCHES/documenso-v2.15.0-millave.1.patch'
+PATCH_PATH='PATCHES/documenso-v2.15.0-millave.2.patch'
 SOURCE_DIRECTORY=$1
 SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SOURCE_OFFER_DIRECTORY=$(dirname "$SCRIPT_DIRECTORY")
