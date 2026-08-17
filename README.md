@@ -21,6 +21,13 @@ scope, GNU AGPL v3 availability, and no-warranty statement more explicitly.
 Start with [SOURCE-OFFER.md](SOURCE-OFFER.md). The instructions reproduce and
 verify the current patch against the exact upstream commit.
 
+## Dependency advisories
+
+This repository carries no dependency manifest, lockfile, or vendored
+dependencies, so dependency advisories never apply to its contents.
+Assessments of advisories raised against the pinned upstream dependency graph
+are recorded in [SECURITY-NOTES.md](SECURITY-NOTES.md).
+
 ## Deliberate exclusions
 
 This repository contains no production configuration, credentials, database
