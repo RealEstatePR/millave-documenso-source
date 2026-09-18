@@ -1,18 +1,18 @@
 {
   "schemaVersion": 1,
-  "sourceOfferTag": "documenso-v2.15.0-millave.2",
+  "sourceOfferTag": "documenso-v2.18.0-millave.1",
   "upstream": {
     "repository": "https://github.com/documenso/documenso",
-    "tag": "v2.15.0",
-    "commit": "c5efd34e95737f98f64c31214cebee80fb598f29",
+    "tag": "v2.18.0",
+    "commit": "389390c884949fe27c240488a3259da3cdba93e0",
     "dockerfile": "docker/Dockerfile",
-    "node": ">=22.0.0",
-    "npm": ">=11.11.0",
-    "packageManager": "npm@11.11.0"
+    "node": ">=24.0.0",
+    "npm": ">=11.17.0",
+    "packageManager": "npm@11.19.1"
   },
   "patch": {
-    "path": "PATCHES/documenso-v2.15.0-millave.2.patch",
-    "sha256": "9602438b2e78b999c2e57b48ce38935116727e622298184a6e5b6b23c36c517c"
+    "path": "PATCHES/documenso-v2.18.0-millave.1.patch",
+    "sha256": "137763c65512661680164f7530cf25d90107baed755970e99a3dfadf9ebc6754"
   },
   "containsProductionSecrets": false,
   "containsProductionData": false,

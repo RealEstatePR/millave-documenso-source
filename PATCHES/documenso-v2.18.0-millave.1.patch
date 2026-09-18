@@ -1,0 +1,1027 @@
+diff --git a/.env.example b/.env.example
+index 5f3da7c..d970722 100644
+--- a/.env.example
++++ b/.env.example
+@@ -247,3 +247,12 @@ NEXT_PRIVATE_PLAIN_API_KEY=
+ # does this; the matching values there are `documenso` / `password`).
+ # NEXT_PRIVATE_DOCUMENT_CONVERSION_USERNAME=documenso
+ # NEXT_PRIVATE_DOCUMENT_CONVERSION_PASSWORD=password
++# [[MI LLAVE LOCALE HANDOFF]]
++# REQUIRED for https://sign.millave.pr/api/locale-handoff. Use a dedicated,
++# unpadded base64url-encoded 32-byte value. Do not reuse any Documenso key.
++ESIGN_LOCALE_HANDOFF_KEY=
++# OPTIONAL during rotation only. Must use the same 32-byte base64url format.
++ESIGN_LOCALE_HANDOFF_KEY_PREVIOUS=
++# Leave unset unless Railway ingress is configured to strip client-provided
++# proxy headers and set X-Railway-Edge/X-Real-IP itself.
++ESIGN_LOCALE_HANDOFF_TRUST_RAILWAY_PROXY=
+diff --git a/apps/remix/app/root.tsx b/apps/remix/app/root.tsx
+index 096b150..4255371 100644
+--- a/apps/remix/app/root.tsx
++++ b/apps/remix/app/root.tsx
+@@ -24,6 +24,7 @@ import { PreventFlashOnWrongTheme, ThemeProvider, useTheme } from 'remix-themes'
+ import type { Route } from './+types/root';
+ import stylesheet from './app.css?url';
+ import { GenericErrorLayout } from './components/general/generic-error-layout';
++import { SourceOfferBanner } from './components/general/source-offer-banner';
+ import { langCookie } from './storage/lang-cookie.server';
+ import { themeSessionResolver } from './storage/theme-session.server';
+ import { appMetaTags } from './utils/meta';
+@@ -146,6 +147,8 @@ export function LayoutContent({ children }: { children: React.ReactNode }) {
+         <script nonce={nonce(cspNonce)}>0</script>
+       </head>
+       <body className={isRecipientRoute ? 'documenso-branded' : undefined}>
++        <SourceOfferBanner />
++
+         {/* Global license banner currently disabled. Need to wait until after a few releases. */}
+         {/* {licenseStatus === '?' && (
+           <div className="bg-destructive text-destructive-foreground">
+diff --git a/apps/remix/app/routes/api+/locale-handoff.test.ts b/apps/remix/app/routes/api+/locale-handoff.test.ts
+new file mode 100644
+index 0000000..a12f21b
+--- /dev/null
++++ b/apps/remix/app/routes/api+/locale-handoff.test.ts
+@@ -0,0 +1,184 @@
++import type { ActionFunctionArgs } from 'react-router';
++
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { localeHandoffLangCookie } from '~/storage/lang-cookie.server';
++import goldenVector from '../../../../../packages/lib/server-only/locale-handoff/locale-handoff-lh1-golden-vector.json';
++import { action } from './locale-handoff';
++
++const TEST_KEY = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc';
++const REQUEST_URL = 'https://sign.millave.pr/api/locale-handoff';
++
++describe('locale handoff route', () => {
++  beforeEach(() => {
++    vi.restoreAllMocks();
++    vi.unstubAllEnvs();
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', TEST_KEY);
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY_PREVIOUS', '');
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_TRUST_RAILWAY_PROXY', '');
++    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
++  });
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++    vi.unstubAllEnvs();
++  });
++
++  it('accepts the shared golden handoff and sets only the required language cookies', async () => {
++    const response = await invokeAction(createRequest({}, goldenVector.handoff));
++
++    expect(response.status).toBe(303);
++    expect(response.headers.get('Location')).toBe(goldenVector.claims.targetPath);
++    expectPrivacyHeaders(response);
++
++    const setCookies = getSetCookies(response);
++
++    expect(setCookies).toHaveLength(2);
++    expect(setCookies).toContain(
++      'lang=; Path=/; Domain=.millave.pr; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax',
++    );
++
++    const expectedHostOnlyLocaleCookie = await localeHandoffLangCookie.serialize('es');
++    const hostOnlyLocaleCookie = setCookies.find((cookie) => cookie === expectedHostOnlyLocaleCookie);
++
++    expect(hostOnlyLocaleCookie).toBe(expectedHostOnlyLocaleCookie);
++    expect(hostOnlyLocaleCookie).not.toContain('Domain=');
++    expect(hostOnlyLocaleCookie).toContain('Path=/');
++    expect(hostOnlyLocaleCookie).toContain('HttpOnly');
++    expect(hostOnlyLocaleCookie).toContain('Secure');
++    expect(hostOnlyLocaleCookie).toContain('SameSite=Lax');
++  });
++
++  it('returns a private 404 without cookies or a redirect for tampered or malformed handoffs', async () => {
++    const lastCharacter = goldenVector.handoff.at(-1);
++    const tamperedHandoff = `${goldenVector.handoff.slice(0, -1)}${lastCharacter === 's' ? 't' : 's'}`;
++
++    for (const handoff of [tamperedHandoff, 'not-a-handoff']) {
++      const response = await invokeAction(createRequest({}, handoff));
++
++      expect(response.status).toBe(404);
++      expectPrivateFailureResponse(response);
++    }
++  });
++
++  it('returns a private 503 without cookies or a redirect for a malformed host key', async () => {
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', 'not-a-32-byte-base64url-key');
++
++    const response = await invokeAction(createRequest({}, goldenVector.handoff));
++
++    expect(response.status).toBe(503);
++    expectPrivateFailureResponse(response);
++  });
++
++  it('returns a generic private 429 for concurrency exhaustion', async () => {
++    const blockingRequests = Array.from({ length: 20 }, () => createBlockingRequest());
++    const pendingResponses = blockingRequests.map(({ request }) => invokeAction(request));
++
++    const response = await invokeAction(createRequest());
++
++    expect(response.status).toBe(429);
++    expectPrivateFailureResponse(response);
++
++    for (const { release } of blockingRequests) {
++      release();
++    }
++
++    await Promise.all(pendingResponses);
++  });
++
++  it('uses canonical IP parsing and returns the same generic 429 when a trusted IP reaches its limit', async () => {
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_TRUST_RAILWAY_PROXY', 'true');
++
++    for (let requestNumber = 0; requestNumber < 31; requestNumber += 1) {
++      const response = await invokeAction(
++        createRequest({
++          'X-Railway-Edge': 'configured',
++          'X-Real-IP': '123.456.789.999',
++        }),
++      );
++
++      // The old character-class check accepted this malformed address. Node's
++      // parser rejects it, leaving only the global limit in effect.
++      expect(response.status).toBe(404);
++    }
++
++    let response: Response | null = null;
++
++    for (let requestNumber = 0; requestNumber < 31; requestNumber += 1) {
++      response = await invokeAction(
++        createRequest({
++          'X-Railway-Edge': 'configured',
++          'X-Real-IP': '203.0.113.7',
++        }),
++      );
++    }
++
++    expect(response?.status).toBe(429);
++    expectPrivateFailureResponse(response as Response);
++  });
++});
++
++const createRequest = (headers: Record<string, string> = {}, handoff = 'not-valid'): Request => {
++  const body = new URLSearchParams({ handoff }).toString();
++
++  return new Request(REQUEST_URL, {
++    method: 'POST',
++    headers: {
++      'Content-Length': String(Buffer.byteLength(body)),
++      'Content-Type': 'application/x-www-form-urlencoded',
++      Origin: 'https://millave.pr',
++      ...headers,
++    },
++    body,
++  });
++};
++
++const createBlockingRequest = (): { request: Request; release: () => void } => {
++  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
++  const body = new ReadableStream<Uint8Array>({
++    start(streamController) {
++      controller = streamController;
++    },
++  });
++  const request = new Request(REQUEST_URL, {
++    method: 'POST',
++    headers: {
++      'Content-Length': String(Buffer.byteLength('handoff=not-valid')),
++      'Content-Type': 'application/x-www-form-urlencoded',
++      Origin: 'https://millave.pr',
++    },
++    body,
++    duplex: 'half',
++  } as RequestInit);
++
++  return {
++    request,
++    release: () => controller?.close(),
++  };
++};
++
++const invokeAction = (request: Request): Promise<Response> =>
++  action({ request } as ActionFunctionArgs) as Promise<Response>;
++
++const getSetCookies = (response: Response): string[] => {
++  const headers = response.headers as Headers & { getSetCookie?: () => string[] };
++
++  return headers.getSetCookie?.() ?? [];
++};
++
++const expectPrivacyHeaders = (response: Response): void => {
++  expect(response.headers.get('Cache-Control')).toBe('no-store, no-cache, must-revalidate');
++  expect(response.headers.get('Pragma')).toBe('no-cache');
++  expect(response.headers.get('Expires')).toBe('0');
++  expect(response.headers.get('Content-Security-Policy')).toBe(
++    "default-src 'none'; base-uri 'none'; connect-src 'none'; form-action 'none'; frame-ancestors 'none'",
++  );
++  expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
++  expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
++  expect(response.headers.get('X-Robots-Tag')).toBe('noindex, nofollow, noarchive');
++};
++
++const expectPrivateFailureResponse = (response: Response): void => {
++  expectPrivacyHeaders(response);
++  expect(response.headers.get('Location')).toBeNull();
++  expect(getSetCookies(response)).toEqual([]);
++};
+diff --git a/apps/remix/app/routes/api+/locale-handoff.tsx b/apps/remix/app/routes/api+/locale-handoff.tsx
+new file mode 100644
+index 0000000..6dccb9a
+--- /dev/null
++++ b/apps/remix/app/routes/api+/locale-handoff.tsx
+@@ -0,0 +1,307 @@
++import { isIP } from 'node:net';
++import {
++  getLocaleHandoffKeyring,
++  verifyLocaleHandoff,
++} from '@documenso/lib/server-only/locale-handoff/locale-handoff-token';
++import { env } from '@documenso/lib/utils/env';
++import type { ActionFunctionArgs, LoaderFunctionArgs } from 'react-router';
++
++import { localeHandoffLangCookie } from '~/storage/lang-cookie.server';
++
++const SOURCE_ORIGIN = 'https://millave.pr';
++const MAX_REQUEST_BYTES = 8_192;
++const MAX_HANDOFF_LENGTH = 4_096;
++const MAX_CONCURRENT_REQUESTS = 20;
++const GLOBAL_REQUEST_LIMIT = 300;
++const SOURCE_IP_REQUEST_LIMIT = 30;
++const RATE_LIMIT_WINDOW_MS = 60_000;
++const SOURCE_IP_CACHE_TTL_MS = 120_000;
++const MAX_SOURCE_IP_CACHE_ENTRIES = 10_000;
++const PRIVACY_HEADERS = {
++  'Cache-Control': 'no-store, no-cache, must-revalidate',
++  'Content-Security-Policy':
++    "default-src 'none'; base-uri 'none'; connect-src 'none'; form-action 'none'; frame-ancestors 'none'",
++  Expires: '0',
++  Pragma: 'no-cache',
++  'Referrer-Policy': 'no-referrer',
++  'X-Content-Type-Options': 'nosniff',
++  'X-Robots-Tag': 'noindex, nofollow, noarchive',
++};
++
++type SourceIpRateLimitEntry = {
++  count: number;
++  lastSeenAt: number;
++  windowStartedAt: number;
++};
++
++const sourceIpRateLimits = new Map<string, SourceIpRateLimitEntry>();
++let globalWindowStartedAt = 0;
++let globalRequestCount = 0;
++let activeRequestCount = 0;
++
++export const loader = (_args: LoaderFunctionArgs) => notFoundResponse();
++
++export const action = async ({ request }: ActionFunctionArgs) => {
++  if (!isAcceptableRequest(request)) {
++    return notFoundResponse();
++  }
++
++  if (!getLocaleHandoffKeyring().isValid) {
++    return unavailableResponse();
++  }
++
++  if (!tryAcquireConcurrencySlot()) {
++    return rateLimitedResponse();
++  }
++
++  try {
++    const sourceIp = getTrustedRailwayClientIp(request);
++
++    if (!isWithinRateLimit(sourceIp)) {
++      return rateLimitedResponse();
++    }
++
++    const handoff = await readHandoff(request);
++
++    if (!handoff) {
++      return notFoundResponse();
++    }
++
++    const verification = verifyLocaleHandoff(handoff);
++
++    if (!verification.isValid) {
++      return verification.isConfigurationError ? unavailableResponse() : notFoundResponse();
++    }
++
++    const headers = new Headers(PRIVACY_HEADERS);
++    headers.set('Location', verification.claims.targetPath);
++    headers.append('Set-Cookie', parentLangCookieDeletion);
++    headers.append('Set-Cookie', await localeHandoffLangCookie.serialize(verification.claims.locale));
++
++    return new Response(null, { status: 303, headers });
++  } finally {
++    releaseConcurrencySlot();
++  }
++};
++
++const isAcceptableRequest = (request: Request): boolean => {
++  if (request.method !== 'POST') {
++    return false;
++  }
++
++  if (request.headers.get('origin') !== SOURCE_ORIGIN) {
++    return false;
++  }
++
++  if (request.headers.get('content-type') !== 'application/x-www-form-urlencoded') {
++    return false;
++  }
++
++  const contentLength = request.headers.get('content-length');
++
++  if (!contentLength || !/^(0|[1-9][0-9]*)$/.test(contentLength)) {
++    return false;
++  }
++
++  const declaredLength = Number(contentLength);
++
++  if (!Number.isSafeInteger(declaredLength) || declaredLength > MAX_REQUEST_BYTES) {
++    return false;
++  }
++
++  return matchesFetchMetadata(request);
++};
++
++const matchesFetchMetadata = (request: Request): boolean => {
++  const expectedHeaders = [
++    ['sec-fetch-site', 'same-site'],
++    ['sec-fetch-mode', 'navigate'],
++    ['sec-fetch-dest', 'document'],
++  ] as const;
++
++  return expectedHeaders.every(([header, expectedValue]) => {
++    const value = request.headers.get(header);
++
++    return value === null || value === expectedValue;
++  });
++};
++
++const readHandoff = async (request: Request): Promise<string | null> => {
++  const contentLength = request.headers.get('content-length');
++  const expectedLength = contentLength ? Number(contentLength) : Number.NaN;
++
++  if (!Number.isSafeInteger(expectedLength) || !request.body) {
++    return null;
++  }
++
++  const reader = request.body.getReader();
++  const chunks: Uint8Array[] = [];
++  let totalLength = 0;
++
++  try {
++    while (true) {
++      const { done, value } = await reader.read();
++
++      if (done) {
++        break;
++      }
++
++      if (!value) {
++        continue;
++      }
++
++      totalLength += value.byteLength;
++
++      if (totalLength > MAX_REQUEST_BYTES) {
++        await reader.cancel();
++
++        return null;
++      }
++
++      chunks.push(value);
++    }
++
++    if (totalLength !== expectedLength) {
++      return null;
++    }
++
++    const body = new Uint8Array(totalLength);
++    let offset = 0;
++
++    for (const chunk of chunks) {
++      body.set(chunk, offset);
++      offset += chunk.byteLength;
++    }
++
++    const params = new URLSearchParams(new TextDecoder('utf-8', { fatal: true }).decode(body));
++    const entries = Array.from(params.entries());
++
++    if (entries.length !== 1 || entries[0][0] !== 'handoff') {
++      return null;
++    }
++
++    const handoff = entries[0][1];
++
++    if (handoff.length === 0 || handoff.length > MAX_HANDOFF_LENGTH) {
++      return null;
++    }
++
++    return handoff;
++  } catch {
++    return null;
++  }
++};
++
++const getTrustedRailwayClientIp = (request: Request): string | null => {
++  // This remains disabled unless the Railway operator has explicitly confirmed
++  // that direct ingress is blocked and Railway strips client-supplied proxy
++  // headers. Without that deployment invariant, forwarded headers are ignored.
++  if (env('ESIGN_LOCALE_HANDOFF_TRUST_RAILWAY_PROXY') !== 'true') {
++    return null;
++  }
++
++  if (!request.headers.get('x-railway-edge')) {
++    return null;
++  }
++
++  const clientIp = request.headers.get('x-real-ip');
++
++  if (!clientIp || isIP(clientIp) === 0) {
++    return null;
++  }
++
++  return clientIp;
++};
++
++const isWithinRateLimit = (sourceIp: string | null): boolean => {
++  const now = Date.now();
++  const windowStartedAt = now - (now % RATE_LIMIT_WINDOW_MS);
++
++  if (globalWindowStartedAt !== windowStartedAt) {
++    globalWindowStartedAt = windowStartedAt;
++    globalRequestCount = 0;
++  }
++
++  evictStaleSourceIpEntries(now);
++
++  let sourceIpEntry: SourceIpRateLimitEntry | null = null;
++
++  if (sourceIp) {
++    sourceIpEntry = sourceIpRateLimits.get(sourceIp) ?? null;
++
++    if (!sourceIpEntry || sourceIpEntry.windowStartedAt !== windowStartedAt) {
++      sourceIpEntry = { count: 0, lastSeenAt: now, windowStartedAt };
++    }
++
++    if (sourceIpEntry.count >= SOURCE_IP_REQUEST_LIMIT) {
++      return false;
++    }
++  }
++
++  if (globalRequestCount >= GLOBAL_REQUEST_LIMIT) {
++    return false;
++  }
++
++  globalRequestCount += 1;
++
++  if (sourceIp && sourceIpEntry) {
++    sourceIpEntry.count += 1;
++    sourceIpEntry.lastSeenAt = now;
++    sourceIpRateLimits.delete(sourceIp);
++    sourceIpRateLimits.set(sourceIp, sourceIpEntry);
++    trimSourceIpCache();
++  }
++
++  return true;
++};
++
++const evictStaleSourceIpEntries = (now: number): void => {
++  for (const [sourceIp, entry] of sourceIpRateLimits) {
++    if (now - entry.lastSeenAt > SOURCE_IP_CACHE_TTL_MS) {
++      sourceIpRateLimits.delete(sourceIp);
++    }
++  }
++};
++
++const trimSourceIpCache = (): void => {
++  while (sourceIpRateLimits.size > MAX_SOURCE_IP_CACHE_ENTRIES) {
++    const oldestSourceIp = sourceIpRateLimits.keys().next().value;
++
++    if (!oldestSourceIp) {
++      return;
++    }
++
++    sourceIpRateLimits.delete(oldestSourceIp);
++  }
++};
++
++const tryAcquireConcurrencySlot = (): boolean => {
++  if (activeRequestCount >= MAX_CONCURRENT_REQUESTS) {
++    return false;
++  }
++
++  activeRequestCount += 1;
++
++  return true;
++};
++
++const releaseConcurrencySlot = (): void => {
++  activeRequestCount = Math.max(0, activeRequestCount - 1);
++};
++
++const notFoundResponse = (): Response => new Response(null, { status: 404, headers: PRIVACY_HEADERS });
++
++const unavailableResponse = (): Response => new Response(null, { status: 503, headers: PRIVACY_HEADERS });
++
++const rateLimitedResponse = (): Response => new Response(null, { status: 429, headers: PRIVACY_HEADERS });
++
++const parentLangCookieDeletion = [
++  'lang=',
++  'Path=/',
++  'Domain=.millave.pr',
++  'Max-Age=0',
++  'Expires=Thu, 01 Jan 1970 00:00:00 GMT',
++  'HttpOnly',
++  'Secure',
++  'SameSite=Lax',
++].join('; ');
+diff --git a/apps/remix/app/storage/lang-cookie.server.ts b/apps/remix/app/storage/lang-cookie.server.ts
+index 2610173..4e5ee1a 100644
+--- a/apps/remix/app/storage/lang-cookie.server.ts
++++ b/apps/remix/app/storage/lang-cookie.server.ts
+@@ -6,4 +6,15 @@ export const langCookie = createCookie('lang', {
+   maxAge: 60 * 60 * 24 * 365 * 2,
+   httpOnly: true,
+   secure: env('NODE_ENV') === 'production',
++  sameSite: 'lax',
++});
++
++// The handoff endpoint must never weaken the cookie when a deployment has an
++// incomplete NODE_ENV setting. This remains host-only because no domain is set.
++export const localeHandoffLangCookie = createCookie('lang', {
++  path: '/',
++  maxAge: 60 * 60 * 24 * 365 * 2,
++  httpOnly: true,
++  secure: true,
++  sameSite: 'lax',
+ });
+diff --git a/packages/lib/server-only/locale-handoff/locale-handoff-lh1-golden-vector.json b/packages/lib/server-only/locale-handoff/locale-handoff-lh1-golden-vector.json
+new file mode 100644
+index 0000000..386b2ba
+--- /dev/null
++++ b/packages/lib/server-only/locale-handoff/locale-handoff-lh1-golden-vector.json
+@@ -0,0 +1,12 @@
++{
++  "handoff": "lh1.S7Bvjk46dxU.AwMDAwMDAwMDAwMD.3tpgKfZB0GB0GK8wejhf5URbFlO38f4uVc4AXo7x147Ffz9kOAcSubVDZcuRBPkUqqAocQPHatBTBj2LdMSEl6fxlZyxkPNxkW9DOPfsGk4dSdaTCTrFu44QHNeFCS53YjPoXGsscSQaMP6927CsOjsfwUN3FNDVe_zsM1L-DKiVMrJPJmWlxaSDXhfTZ4E33ihQOr8wYzA.yiRJCBJRb6-Gm-7radBp8w.x6kA-D82lbrzz0f_JeOOQ_aeH3kJqVTU2LYzQzFje-s",
++  "claims": {
++    "v": 1,
++    "iss": "https://millave.pr",
++    "aud": "https://sign.millave.pr",
++    "iat": 1700000000,
++    "exp": 1700000090,
++    "locale": "es",
++    "targetPath": "/sign/1234567890abcdef"
++  }
++}
+diff --git a/packages/lib/server-only/locale-handoff/locale-handoff-token.test.ts b/packages/lib/server-only/locale-handoff/locale-handoff-token.test.ts
+new file mode 100644
+index 0000000..b6b491a
+--- /dev/null
++++ b/packages/lib/server-only/locale-handoff/locale-handoff-token.test.ts
+@@ -0,0 +1,118 @@
++import { createCipheriv, createHash, createHmac, hkdfSync } from 'node:crypto';
++
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import goldenVector from './locale-handoff-lh1-golden-vector.json';
++import { verifyLocaleHandoff } from './locale-handoff-token';
++
++const TEST_KEY = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc';
++const ROTATED_TEST_KEY = 'CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg';
++const { handoff: GOLDEN_HANDOFF, claims: canonicalClaims } = goldenVector;
++
++describe('verifyLocaleHandoff', () => {
++  beforeEach(() => {
++    vi.unstubAllEnvs();
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', TEST_KEY);
++  });
++
++  afterEach(() => {
++    vi.unstubAllEnvs();
++  });
++
++  it('accepts the deterministic lh1 golden vector and permits an in-lifetime replay', () => {
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_000)).toEqual({
++      isValid: true,
++      claims: canonicalClaims,
++    });
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_090)).toEqual({
++      isValid: true,
++      claims: canonicalClaims,
++    });
++  });
++
++  it('rejects a tampered handoff before decryption', () => {
++    const tampered = `${GOLDEN_HANDOFF.slice(0, -1)}${GOLDEN_HANDOFF.endsWith('s') ? 't' : 's'}`;
++
++    expect(verifyLocaleHandoff(tampered, 1_700_000_000)).toEqual({
++      isValid: false,
++      isConfigurationError: false,
++    });
++  });
++
++  it('rejects handoffs immediately after expiry while allowing only future iat skew', () => {
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_091)).toEqual({
++      isValid: false,
++      isConfigurationError: false,
++    });
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_699_999_970).isValid).toBe(true);
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_699_999_969)).toEqual({
++      isValid: false,
++      isConfigurationError: false,
++    });
++  });
++
++  it('accepts a previous key during rotation but rejects an ambiguous keyring', () => {
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', ROTATED_TEST_KEY);
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY_PREVIOUS', TEST_KEY);
++
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_000).isValid).toBe(true);
++
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', TEST_KEY);
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY_PREVIOUS', TEST_KEY);
++
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_000)).toEqual({
++      isValid: false,
++      isConfigurationError: true,
++    });
++  });
++
++  it('fails closed when the dedicated key is missing or malformed', () => {
++    vi.stubEnv('ESIGN_LOCALE_HANDOFF_KEY', 'not-a-32-byte-base64url-key');
++
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_000)).toEqual({
++      isValid: false,
++      isConfigurationError: true,
++    });
++
++    vi.unstubAllEnvs();
++
++    expect(verifyLocaleHandoff(GOLDEN_HANDOFF, 1_700_000_000)).toEqual({
++      isValid: false,
++      isConfigurationError: true,
++    });
++  });
++
++  it('rejects authenticated claims outside the exact lh1 contract', () => {
++    const wrongVersion = createHandoff({ ...canonicalClaims, v: 2 });
++    const wrongIssuer = createHandoff({ ...canonicalClaims, iss: 'https://not-millave.pr' });
++    const wrongAudience = createHandoff({ ...canonicalClaims, aud: 'https://not-sign.millave.pr' });
++    const overlongExpiry = createHandoff({ ...canonicalClaims, exp: canonicalClaims.iat + 91 });
++    const wrongLocale = createHandoff({ ...canonicalClaims, locale: 'fr' });
++    const wrongTarget = createHandoff({ ...canonicalClaims, targetPath: '/documents/1234567890abcdef' });
++
++    for (const handoff of [wrongVersion, wrongIssuer, wrongAudience, overlongExpiry, wrongLocale, wrongTarget]) {
++      expect(verifyLocaleHandoff(handoff, 1_700_000_000)).toEqual({
++        isValid: false,
++        isConfigurationError: false,
++      });
++    }
++  });
++});
++
++const createHandoff = (claims: Record<string, unknown>): string => {
++  const masterKey = Buffer.from(TEST_KEY, 'base64url');
++  const keyId = createHash('sha256').update(masterKey).digest().subarray(0, 8).toString('base64url');
++  const salt = createHash('sha256').update('millave-esign-locale-handoff-lh1').digest();
++  const encryptionKey = Buffer.from(hkdfSync('sha256', masterKey, salt, Buffer.from('lh1/encryption', 'utf8'), 32));
++  const signingKey = Buffer.from(hkdfSync('sha256', masterKey, salt, Buffer.from('lh1/signing', 'utf8'), 32));
++  const iv = Buffer.alloc(12, 3);
++  const prefix = `lh1.${keyId}.${iv.toString('base64url')}`;
++  const cipher = createCipheriv('aes-256-gcm', encryptionKey, iv);
++  cipher.setAAD(Buffer.from(prefix, 'utf8'));
++
++  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(claims), 'utf8'), cipher.final()]);
++  const outerPrefix = `${prefix}.${ciphertext.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}`;
++  const mac = createHmac('sha256', signingKey).update(outerPrefix, 'utf8').digest().toString('base64url');
++
++  return `${outerPrefix}.${mac}`;
++};
+diff --git a/packages/lib/server-only/locale-handoff/locale-handoff-token.ts b/packages/lib/server-only/locale-handoff/locale-handoff-token.ts
+new file mode 100644
+index 0000000..1b84f94
+--- /dev/null
++++ b/packages/lib/server-only/locale-handoff/locale-handoff-token.ts
+@@ -0,0 +1,247 @@
++import { createDecipheriv, createHash, createHmac, hkdfSync, timingSafeEqual } from 'node:crypto';
++
++import { env } from '../../utils/env';
++
++const FORMAT = 'lh1';
++const ISSUER = 'https://millave.pr';
++const AUDIENCE = 'https://sign.millave.pr';
++const TTL_SECONDS = 90;
++const CLOCK_SKEW_SECONDS = 30;
++const MAX_HANDOFF_LENGTH = 4_096;
++const MASTER_KEY_BYTES = 32;
++const KEY_ID_BYTES = 8;
++const GCM_IV_BYTES = 12;
++const GCM_TAG_BYTES = 16;
++
++const HANDOFF_SALT = createHash('sha256').update('millave-esign-locale-handoff-lh1').digest();
++const ENCRYPTION_INFO = Buffer.from('lh1/encryption', 'utf8');
++const SIGNING_INFO = Buffer.from('lh1/signing', 'utf8');
++const TARGET_PATH_PATTERN = /^\/sign\/[A-Za-z0-9_-]{16,128}$/;
++const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
++const CLAIM_KEYS = ['v', 'iss', 'aud', 'iat', 'exp', 'locale', 'targetPath'] as const;
++
++export type LocaleHandoffClaims = {
++  v: 1;
++  iss: typeof ISSUER;
++  aud: typeof AUDIENCE;
++  iat: number;
++  exp: number;
++  locale: 'es' | 'en';
++  targetPath: string;
++};
++
++type DerivedKey = {
++  keyId: string;
++  encryptionKey: Buffer;
++  signingKey: Buffer;
++};
++
++export type LocaleHandoffKeyringResult = { isValid: true; keys: Map<string, DerivedKey> } | { isValid: false };
++
++export type LocaleHandoffVerification =
++  | { isValid: true; claims: LocaleHandoffClaims }
++  | { isValid: false; isConfigurationError: boolean };
++
++/**
++ * Read the isolated current/previous locale-handoff keyring. This deliberately
++ * does not fall back to any Documenso service key.
++ */
++export const getLocaleHandoffKeyring = (): LocaleHandoffKeyringResult => {
++  const currentMasterKey = decodeMasterKey(env('ESIGN_LOCALE_HANDOFF_KEY'));
++
++  if (!currentMasterKey) {
++    return { isValid: false };
++  }
++
++  const previousValue = env('ESIGN_LOCALE_HANDOFF_KEY_PREVIOUS');
++  const previousMasterKey = previousValue ? decodeMasterKey(previousValue) : null;
++
++  if (previousValue && !previousMasterKey) {
++    return { isValid: false };
++  }
++
++  const keys = [currentMasterKey, previousMasterKey].filter((key): key is Buffer => key !== null).map(deriveKey);
++  const keysById = new Map<string, DerivedKey>();
++
++  for (const key of keys) {
++    // A key-id collision would make candidate selection ambiguous. Treat it as
++    // malformed configuration instead of accepting an arbitrary candidate.
++    if (keysById.has(key.keyId)) {
++      return { isValid: false };
++    }
++
++    keysById.set(key.keyId, key);
++  }
++
++  return { isValid: true, keys: keysById };
++};
++
++export const verifyLocaleHandoff = (
++  handoff: string,
++  now = Math.floor(Date.now() / 1_000),
++): LocaleHandoffVerification => {
++  const keyring = getLocaleHandoffKeyring();
++
++  if (!keyring.isValid) {
++    return { isValid: false, isConfigurationError: true };
++  }
++
++  if (handoff.length === 0 || handoff.length > MAX_HANDOFF_LENGTH) {
++    return { isValid: false, isConfigurationError: false };
++  }
++
++  const parts = handoff.split('.');
++
++  if (parts.length !== 6 || parts[0] !== FORMAT) {
++    return { isValid: false, isConfigurationError: false };
++  }
++
++  const [format, keyId, ivValue, ciphertextValue, tagValue, macValue] = parts;
++  const iv = decodeBase64Url(ivValue);
++  const ciphertext = decodeBase64Url(ciphertextValue);
++  const tag = decodeBase64Url(tagValue);
++  const mac = decodeBase64Url(macValue);
++  const decodedKeyId = decodeBase64Url(keyId);
++
++  if (
++    !iv ||
++    !ciphertext ||
++    !tag ||
++    !mac ||
++    !decodedKeyId ||
++    decodedKeyId.length !== KEY_ID_BYTES ||
++    iv.length !== GCM_IV_BYTES ||
++    ciphertext.length === 0 ||
++    tag.length !== GCM_TAG_BYTES ||
++    mac.length !== 32
++  ) {
++    return { isValid: false, isConfigurationError: false };
++  }
++
++  const key = keyring.keys.get(keyId);
++
++  if (!key) {
++    return { isValid: false, isConfigurationError: false };
++  }
++
++  const authenticatedPrefix = [format, keyId, ivValue, ciphertextValue, tagValue].join('.');
++  const expectedMac = createHmac('sha256', key.signingKey).update(authenticatedPrefix, 'utf8').digest();
++
++  if (expectedMac.length !== mac.length || !timingSafeEqual(expectedMac, mac)) {
++    return { isValid: false, isConfigurationError: false };
++  }
++
++  try {
++    const decipher = createDecipheriv('aes-256-gcm', key.encryptionKey, iv);
++    decipher.setAAD(Buffer.from(`${format}.${keyId}.${ivValue}`, 'utf8'));
++    decipher.setAuthTag(tag);
++
++    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
++    const claims = parseExactClaims(plaintext, now);
++
++    if (!claims) {
++      return { isValid: false, isConfigurationError: false };
++    }
++
++    return { isValid: true, claims };
++  } catch {
++    return { isValid: false, isConfigurationError: false };
++  }
++};
++
++const decodeMasterKey = (value: string | undefined): Buffer | null => {
++  if (!value || value.length !== 43 || !BASE64URL_PATTERN.test(value)) {
++    return null;
++  }
++
++  const decoded = decodeBase64Url(value);
++
++  if (!decoded || decoded.length !== MASTER_KEY_BYTES) {
++    return null;
++  }
++
++  return decoded;
++};
++
++const decodeBase64Url = (value: string): Buffer | null => {
++  if (!value || !BASE64URL_PATTERN.test(value)) {
++    return null;
++  }
++
++  try {
++    const decoded = Buffer.from(value, 'base64url');
++
++    if (decoded.length === 0 || decoded.toString('base64url') !== value) {
++      return null;
++    }
++
++    return decoded;
++  } catch {
++    return null;
++  }
++};
++
++const deriveKey = (masterKey: Buffer): DerivedKey => {
++  const keyId = createHash('sha256').update(masterKey).digest().subarray(0, KEY_ID_BYTES).toString('base64url');
++
++  return {
++    keyId,
++    encryptionKey: Buffer.from(hkdfSync('sha256', masterKey, HANDOFF_SALT, ENCRYPTION_INFO, 32)),
++    signingKey: Buffer.from(hkdfSync('sha256', masterKey, HANDOFF_SALT, SIGNING_INFO, 32)),
++  };
++};
++
++const parseExactClaims = (plaintext: string, now: number): LocaleHandoffClaims | null => {
++  let parsed: unknown;
++
++  try {
++    parsed = JSON.parse(plaintext) as unknown;
++  } catch {
++    return null;
++  }
++
++  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
++    return null;
++  }
++
++  const record = parsed as Record<string, unknown>;
++
++  if (
++    Object.keys(record).length !== CLAIM_KEYS.length ||
++    CLAIM_KEYS.some((key) => !Object.hasOwn(record, key)) ||
++    record.v !== 1 ||
++    record.iss !== ISSUER ||
++    record.aud !== AUDIENCE ||
++    typeof record.iat !== 'number' ||
++    !Number.isSafeInteger(record.iat) ||
++    typeof record.exp !== 'number' ||
++    !Number.isSafeInteger(record.exp) ||
++    (record.locale !== 'es' && record.locale !== 'en') ||
++    typeof record.targetPath !== 'string' ||
++    !TARGET_PATH_PATTERN.test(record.targetPath)
++  ) {
++    return null;
++  }
++
++  const claims: LocaleHandoffClaims = {
++    v: 1,
++    iss: ISSUER,
++    aud: AUDIENCE,
++    iat: record.iat,
++    exp: record.exp,
++    locale: record.locale,
++    targetPath: record.targetPath,
++  };
++
++  // JSON itself is part of the authenticated format. Reject alternate key
++  // orders, whitespace, and extra fields rather than merely normalizing them.
++  if (JSON.stringify(claims) !== plaintext) {
++    return null;
++  }
++
++  if (claims.exp !== claims.iat + TTL_SECONDS || claims.iat > now + CLOCK_SKEW_SECONDS || now > claims.exp) {
++    return null;
++  }
++
++  return claims;
++};
+diff --git a/apps/remix/app/components/general/source-offer-banner.tsx b/apps/remix/app/components/general/source-offer-banner.tsx
+new file mode 100644
+index 0000000..7838710
+--- /dev/null
++++ b/apps/remix/app/components/general/source-offer-banner.tsx
+@@ -0,0 +1,26 @@
++import { Trans } from '@lingui/react/macro';
++
++// This link is intentionally a stable public source-offer tag rather than a
++// deployment setting. It must remain available to every person using the
++// modified signing host and carries no user, document, or runtime data.
++export const SOURCE_OFFER_URL =
++  'https://github.com/RealEstatePR/millave-documenso-source/tree/documenso-v2.18.0-millave.1';
++
++export const SourceOfferBanner = () => (
++  <div className="border-b bg-background px-4 py-1 text-center text-muted-foreground text-xs">
++    <span>
++      <Trans>
++        © 2026 Tu Llave PR LLC. Mi Llave's modifications are provided under GNU AGPL v3, without warranty.
++      </Trans>{' '}
++    </span>
++    <a
++      href={SOURCE_OFFER_URL}
++      target="_blank"
++      rel="noopener noreferrer"
++      referrerPolicy="no-referrer"
++      className="underline underline-offset-2 hover:text-foreground"
++    >
++      <Trans>View source and license</Trans>
++    </a>
++  </div>
++);
+diff --git a/apps/remix/app/components/general/source-offer-banner.test.tsx b/apps/remix/app/components/general/source-offer-banner.test.tsx
+new file mode 100644
+index 0000000..f7cba3a
+--- /dev/null
++++ b/apps/remix/app/components/general/source-offer-banner.test.tsx
+@@ -0,0 +1,33 @@
++import { setupI18n } from '@lingui/core';
++import { I18nProvider } from '@lingui/react';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { describe, expect, it } from 'vitest';
++
++import { SOURCE_OFFER_URL, SourceOfferBanner } from './source-offer-banner';
++
++describe('SourceOfferBanner', () => {
++  it('provides the AGPL notice, source offer, and no-referrer protection without exposing signing paths', () => {
++    const i18n = setupI18n({ locale: 'en' });
++    const markup = renderToStaticMarkup(
++      <I18nProvider i18n={i18n}>
++        <SourceOfferBanner />
++      </I18nProvider>,
++    );
++
++    expect(markup).toContain('© 2026 Tu Llave PR LLC.');
++    expect(markup).toContain('Mi Llave&#x27;s modifications are provided under GNU AGPL v3');
++    expect(markup).toContain('GNU AGPL v3');
++    expect(markup).toContain('without warranty');
++    expect(markup).toContain('>View source and license</a>');
++    expect(SOURCE_OFFER_URL).toBe(
++      'https://github.com/RealEstatePR/millave-documenso-source/tree/documenso-v2.18.0-millave.1',
++    );
++    expect(markup).toContain(
++      'href="https://github.com/RealEstatePR/millave-documenso-source/tree/documenso-v2.18.0-millave.1"',
++    );
++    expect(markup).toContain('target="_blank"');
++    expect(markup).toContain('rel="noopener noreferrer"');
++    expect(markup).toContain('referrerPolicy="no-referrer"');
++    expect(markup).not.toContain('/sign/');
++  });
++});
